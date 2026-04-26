@@ -1,234 +1,471 @@
-import requests, json, time, os
-from datetime import datetime
+"""
+Crypto Trading Signal Bot
+=========================
+- Fetches top 20 coins from CoinGecko
+- Calculates RSI from hourly OHLCV data
+- Fetches news from NewsAPI
+- Uses Gemini AI (google-genai) for BUY/SELL/NO TRADE decisions
+- Sends signals to Telegram
+- Tracks active trades for TP/SL alerts
+- Runs every 15 min (signals) and every 1 min (trade tracking)
+- Designed for Railway deployment with env vars
+"""
+
+import os
+import time
+import logging
+import traceback
+from datetime import datetime, timezone
+from typing import Optional
+
+import requests
 from google import genai
+from google.genai import types
 
-GEMINI_API_KEY = os.environ["GEMINI_API_KEY"]
-TELEGRAM_BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
-TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
-NEWS_API_KEY = os.environ["NEWS_API_KEY"]
+# ─────────────────────────────────────────────
+# Logging
+# ─────────────────────────────────────────────
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+log = logging.getLogger(__name__)
 
-client = genai.Client(api_key=GEMINI_API_KEY)
-SENT_FILE = "sent_coins.json"
-TRADE_FILE = "active_trades.json"
+# ─────────────────────────────────────────────
+# Environment Variables
+# ─────────────────────────────────────────────
+GEMINI_API_KEY    = os.environ.get("GEMINI_API_KEY", "")
+NEWS_API_KEY      = os.environ.get("NEWS_API_KEY", "")
+TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+TELEGRAM_CHAT_ID  = os.environ.get("TELEGRAM_CHAT_ID", "")
 
-COINS = [
-    "bitcoin", "ethereum", "solana", "binancecoin", "ripple",
-    "cardano", "dogecoin", "avalanche-2", "polkadot", "matic-network",
-    "chainlink", "uniswap", "litecoin", "stellar", "cosmos",
-    "near", "algorand", "vechain", "tezos", "flow"
-]
+SIGNAL_INTERVAL_SEC = int(os.environ.get("SIGNAL_INTERVAL_SEC", "900"))   # 15 min
+TRACK_INTERVAL_SEC  = int(os.environ.get("TRACK_INTERVAL_SEC", "60"))      # 1 min
 
-def load_json(file):
+TP_PERCENT = float(os.environ.get("TP_PERCENT", "3.0"))   # Take-profit %
+SL_PERCENT = float(os.environ.get("SL_PERCENT", "1.5"))   # Stop-loss %
+
+COINGECKO_BASE = "https://api.coingecko.com/api/v3"
+NEWS_API_BASE  = "https://newsapi.org/v2"
+
+# ─────────────────────────────────────────────
+# Gemini client (google-genai)
+# ─────────────────────────────────────────────
+gemini_client: Optional[genai.Client] = None
+
+def init_gemini() -> bool:
+    global gemini_client
+    if not GEMINI_API_KEY:
+        log.error("GEMINI_API_KEY not set.")
+        return False
     try:
-        with open(file) as f:
-            return json.load(f)
-    except:
-        return [] if file == SENT_FILE else []
+        gemini_client = genai.Client(api_key=GEMINI_API_KEY)
+        log.info("Gemini client initialised.")
+        return True
+    except Exception as e:
+        log.error(f"Gemini init failed: {e}")
+        return False
 
-def save_json(file, data):
-    with open(file, "w") as f:
-        json.dump(data, f)
+# ─────────────────────────────────────────────
+# Active Trade Tracker  {coin_id: trade_dict}
+# ─────────────────────────────────────────────
+active_trades: dict = {}
 
-def fetch_market(cid):
-    url = f"https://api.coingecko.com/api/v3/coins/{cid}"
-    p = {"localization": "false", "tickers": "false", "community_data": "false", "developer_data": "false", "sparkline": "false"}
-    r = requests.get(url, params=p)
-    if r.status_code == 200:
-        d = r.json().get("market_data", {})
-        return {
-            "id": cid, "name": r.json().get("name"), "symbol": r.json().get("symbol").upper(),
-            "price": d.get("current_price", {}).get("usd"),
-            "change": d.get("price_change_percentage_24h"),
-            "vol": d.get("total_volume", {}).get("usd")
-        }
-    return None
-
-def fetch_ohlcv(cid):
-    url = f"https://api.coingecko.com/api/v3/coins/{cid}/ohlc"
-    r = requests.get(url, params={"vs_currency": "usd", "days": 3})
-    if r.status_code == 200:
-        return [c[4] for c in r.json()]
-    return []
-
-def calc_rsi(prices, p=14):
-    if len(prices) < p+1:
-        return None
-    g, l = [], []
-    for i in range(1, len(prices)):
-        d = prices[i] - prices[i-1]
-        g.append(d if d>0 else 0)
-        l.append(abs(d) if d<0 else 0)
-    ag = sum(g[-p:])/p
-    al = sum(l[-p:])/p
-    return round(100 - (100/(1+ag/al)), 2) if al else 100
-
-def fetch_news(name):
-    try:
-        url = "https://newsapi.org/v2/everything"
-        p = {"q": f"{name} crypto", "apiKey": NEWS_API_KEY, "pageSize": 3, "sortBy": "publishedAt", "language": "en"}
-        r = requests.get(url, params=p)
-        if r.status_code == 200:
-            return [a["title"] for a in r.json().get("articles", [])[:3]]
-    except:
-        pass
-    return []
-
-def ai_signal(asset, rsi_val, news):
-    nt = "\n".join([f"- {n}" for n in news]) if news else "No news"
-    prompt = f"""Strict crypto AI. Output ONLY valid JSON. No extra text.
-
-Rules: RSI < 40 + positive news = BUY. RSI > 60 + negative news = SELL.
-RSI 40-60 or mixed = NO TRADE. Only signal if 65%+ confidence.
-
-{asset['name']} ({asset['symbol']})
-Price: ${asset['price']}
-RSI: {rsi_val}
-24h Change: {asset['change']}%
-Volume: ${asset['vol']}
-News: {nt}
-
-Return exact: {{"action":"BUY","confidence":72,"reasoning":"short","entry":42000,"tp":43000,"sl":41500}}"""
-    try:
-        resp = client.models.generate_content(model="gemini-2.0-flash", contents=prompt)
-        raw = resp.text.strip().replace("```json","").replace("```","")
-        return json.loads(raw)
-    except:
-        return None
-
-def send_tg(msg):
+# ─────────────────────────────────────────────
+# Telegram
+# ─────────────────────────────────────────────
+def send_telegram(message: str) -> bool:
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        log.warning("Telegram credentials missing — skipping message.")
+        return False
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    requests.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": msg})
+    payload = {
+        "chat_id": TELEGRAM_CHAT_ID,
+        "text": message,
+        "parse_mode": "HTML",
+    }
+    try:
+        resp = requests.post(url, json=payload, timeout=10)
+        resp.raise_for_status()
+        log.info("Telegram message sent.")
+        return True
+    except requests.exceptions.RequestException as e:
+        log.error(f"Telegram send failed: {e}")
+        return False
 
-def fetch_price(coin_id):
-    url = "https://api.coingecko.com/api/v3/simple/price"
-    params = {"ids": coin_id, "vs_currencies": "usd"}
-    r = requests.get(url, params=params)
-    if r.status_code == 200:
-        return r.json().get(coin_id, {}).get("usd")
-    return None
+# ─────────────────────────────────────────────
+# CoinGecko — Top 20 Coins
+# ─────────────────────────────────────────────
+def fetch_top_coins(n: int = 20) -> list[dict]:
+    url = f"{COINGECKO_BASE}/coins/markets"
+    params = {
+        "vs_currency": "usd",
+        "order": "market_cap_desc",
+        "per_page": n,
+        "page": 1,
+        "sparkline": False,
+    }
+    try:
+        resp = requests.get(url, params=params, timeout=15)
+        resp.raise_for_status()
+        coins = resp.json()
+        log.info(f"Fetched {len(coins)} coins from CoinGecko.")
+        return coins
+    except requests.exceptions.HTTPError as e:
+        log.error(f"CoinGecko HTTP error (markets): {e} — {resp.text[:200]}")
+    except requests.exceptions.RequestException as e:
+        log.error(f"CoinGecko request error (markets): {e}")
+    except Exception as e:
+        log.error(f"Unexpected error fetching coins: {e}")
+    return []
 
-def generate_signals():
-    sent = load_json(SENT_FILE)
-    trades = load_json(TRADE_FILE)
-    found = 0
-    for cid in COINS:
-        if cid in sent:
+# ─────────────────────────────────────────────
+# CoinGecko — Hourly OHLCV  (last ~2 days)
+# ─────────────────────────────────────────────
+def fetch_ohlcv(coin_id: str, days: int = 2) -> list[list]:
+    """Returns list of [timestamp, open, high, low, close, volume]."""
+    url = f"{COINGECKO_BASE}/coins/{coin_id}/ohlc"
+    params = {"vs_currency": "usd", "days": days}
+    try:
+        resp = requests.get(url, params=params, timeout=15)
+        resp.raise_for_status()
+        data = resp.json()
+        log.debug(f"OHLCV for {coin_id}: {len(data)} candles.")
+        return data  # [timestamp_ms, open, high, low, close]
+    except requests.exceptions.HTTPError as e:
+        log.error(f"CoinGecko OHLCV error ({coin_id}): {e}")
+    except requests.exceptions.RequestException as e:
+        log.error(f"CoinGecko request error ({coin_id}): {e}")
+    except Exception as e:
+        log.error(f"Unexpected OHLCV error ({coin_id}): {e}")
+    return []
+
+# ─────────────────────────────────────────────
+# RSI Calculation
+# ─────────────────────────────────────────────
+def calculate_rsi(ohlcv: list[list], period: int = 14) -> Optional[float]:
+    """Calculates RSI from OHLCV close prices. Returns None if data insufficient."""
+    if not ohlcv or len(ohlcv) < period + 1:
+        return None
+    closes = [candle[4] for candle in ohlcv]  # index 4 = close
+    deltas = [closes[i] - closes[i - 1] for i in range(1, len(closes))]
+    gains = [max(d, 0) for d in deltas]
+    losses = [abs(min(d, 0)) for d in deltas]
+
+    avg_gain = sum(gains[:period]) / period
+    avg_loss = sum(losses[:period]) / period
+
+    for i in range(period, len(deltas)):
+        avg_gain = (avg_gain * (period - 1) + gains[i]) / period
+        avg_loss = (avg_loss * (period - 1) + losses[i]) / period
+
+    if avg_loss == 0:
+        return 100.0
+    rs = avg_gain / avg_loss
+    return round(100 - (100 / (1 + rs)), 2)
+
+# ─────────────────────────────────────────────
+# NewsAPI — fetch coin news
+# ─────────────────────────────────────────────
+def fetch_news(coin_name: str, max_articles: int = 5) -> list[str]:
+    if not NEWS_API_KEY:
+        log.warning("NEWS_API_KEY not set — skipping news fetch.")
+        return []
+    url = f"{NEWS_API_BASE}/everything"
+    params = {
+        "q": coin_name,
+        "language": "en",
+        "sortBy": "publishedAt",
+        "pageSize": max_articles,
+        "apiKey": NEWS_API_KEY,
+    }
+    try:
+        resp = requests.get(url, params=params, timeout=10)
+        resp.raise_for_status()
+        articles = resp.json().get("articles", [])
+        headlines = [
+            a.get("title", "").strip()
+            for a in articles
+            if a.get("title")
+        ]
+        log.debug(f"News for {coin_name}: {len(headlines)} headlines.")
+        return headlines[:max_articles]
+    except requests.exceptions.HTTPError as e:
+        log.error(f"NewsAPI HTTP error ({coin_name}): {e}")
+    except requests.exceptions.RequestException as e:
+        log.error(f"NewsAPI request error ({coin_name}): {e}")
+    except Exception as e:
+        log.error(f"Unexpected news error ({coin_name}): {e}")
+    return []
+
+# ─────────────────────────────────────────────
+# Gemini AI — Signal Decision
+# ─────────────────────────────────────────────
+def get_ai_signal(
+    coin_name: str,
+    symbol: str,
+    price: float,
+    rsi: float,
+    headlines: list[str],
+) -> dict:
+    """Returns dict with keys: signal, confidence, reasoning."""
+    default = {"signal": "NO TRADE", "confidence": "N/A", "reasoning": "AI unavailable"}
+    if not gemini_client:
+        return default
+
+    news_block = "\n".join(f"- {h}" for h in headlines) if headlines else "No recent news available."
+    prompt = f"""You are a professional crypto trading analyst.
+
+Coin: {coin_name} ({symbol.upper()})
+Current Price: ${price:,.4f}
+RSI (14-period, hourly): {rsi}
+
+Recent News Headlines:
+{news_block}
+
+Based on the RSI and sentiment from the news, provide a trading signal.
+Respond ONLY in this exact format (no extra text):
+
+SIGNAL: <BUY | SELL | NO TRADE>
+CONFIDENCE: <HIGH | MEDIUM | LOW>
+REASONING: <one concise sentence>
+"""
+    try:
+        response = gemini_client.models.generate_content(
+            model="gemini-2.0-flash",
+            contents=prompt,
+            config=types.GenerateContentConfig(
+                temperature=0.3,
+                max_output_tokens=150,
+            ),
+        )
+        text = response.text.strip()
+        result = {"signal": "NO TRADE", "confidence": "N/A", "reasoning": text}
+
+        for line in text.splitlines():
+            if line.startswith("SIGNAL:"):
+                result["signal"] = line.replace("SIGNAL:", "").strip()
+            elif line.startswith("CONFIDENCE:"):
+                result["confidence"] = line.replace("CONFIDENCE:", "").strip()
+            elif line.startswith("REASONING:"):
+                result["reasoning"] = line.replace("REASONING:", "").strip()
+
+        log.info(f"AI signal for {symbol}: {result['signal']} ({result['confidence']})")
+        return result
+    except Exception as e:
+        log.error(f"Gemini API error ({coin_name}): {e}")
+        return default
+
+# ─────────────────────────────────────────────
+# Signal Runner — called every 15 minutes
+# ─────────────────────────────────────────────
+def run_signal_cycle():
+    log.info("═" * 50)
+    log.info("▶ Starting signal cycle...")
+    log.info("═" * 50)
+
+    coins = fetch_top_coins(20)
+    if not coins:
+        log.warning("No coins fetched — skipping cycle.")
+        return
+
+    for coin in coins:
+        coin_id   = coin.get("id", "")
+        coin_name = coin.get("name", "")
+        symbol    = coin.get("symbol", "")
+        price     = coin.get("current_price", 0.0)
+
+        log.info(f"Processing {coin_name} ({symbol.upper()}) @ ${price:,.4f}")
+
+        # ── RSI
+        ohlcv = fetch_ohlcv(coin_id, days=2)
+        rsi = calculate_rsi(ohlcv)
+        if rsi is None:
+            log.warning(f"  Insufficient OHLCV data for {coin_name}, skipping.")
             continue
-        m = fetch_market(cid)
-        if not m or not m["price"]:
+        log.info(f"  RSI: {rsi}")
+
+        # ── News
+        headlines = fetch_news(coin_name)
+
+        # ── AI Decision
+        ai = get_ai_signal(coin_name, symbol, price, rsi, headlines)
+        signal     = ai["signal"]
+        confidence = ai["confidence"]
+        reasoning  = ai["reasoning"]
+
+        # ── Only act on BUY or SELL
+        if signal not in ("BUY", "SELL"):
+            log.info(f"  Signal: NO TRADE — skipping.")
+            # Rate-limit CoinGecko: 10-12 calls/min on free tier
+            time.sleep(6)
             continue
-        closes = fetch_ohlcv(cid)
-        rv = calc_rsi(closes)
-        if rv is None:
+
+        # ── Format Telegram message
+        direction = "🟢 BUY" if signal == "BUY" else "🔴 SELL"
+        tp = round(price * (1 + TP_PERCENT / 100), 6) if signal == "BUY" else round(price * (1 - TP_PERCENT / 100), 6)
+        sl = round(price * (1 - SL_PERCENT / 100), 6) if signal == "BUY" else round(price * (1 + SL_PERCENT / 100), 6)
+
+        msg = (
+            f"<b>{direction} Signal — {coin_name} ({symbol.upper()})</b>\n\n"
+            f"💰 Price:      ${price:,.6f}\n"
+            f"📊 RSI:        {rsi}\n"
+            f"🎯 TP:         ${tp:,.6f}  (+{TP_PERCENT}%)\n"
+            f"🛑 SL:         ${sl:,.6f}  (-{SL_PERCENT}%)\n"
+            f"🧠 Confidence: {confidence}\n"
+            f"📝 Reasoning:  {reasoning}\n\n"
+            f"🕐 {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}"
+        )
+        send_telegram(msg)
+        log.info(f"  Sent {signal} signal for {symbol.upper()}.")
+
+        # ── Register trade for tracking
+        active_trades[coin_id] = {
+            "coin_id":   coin_id,
+            "coin_name": coin_name,
+            "symbol":    symbol,
+            "signal":    signal,
+            "entry":     price,
+            "tp":        tp,
+            "sl":        sl,
+            "alerted":   False,
+        }
+
+        time.sleep(6)  # Respect CoinGecko rate limits
+
+    log.info("✅ Signal cycle complete.")
+
+# ─────────────────────────────────────────────
+# Trade Tracker — called every 1 minute
+# ─────────────────────────────────────────────
+def run_trade_tracker():
+    if not active_trades:
+        return
+
+    log.info(f"🔍 Tracking {len(active_trades)} active trade(s)...")
+    closed = []
+
+    for coin_id, trade in list(active_trades.items()):
+        url = f"{COINGECKO_BASE}/simple/price"
+        params = {"ids": coin_id, "vs_currencies": "usd"}
+        try:
+            resp = requests.get(url, params=params, timeout=10)
+            resp.raise_for_status()
+            price_data = resp.json()
+            current_price = price_data.get(coin_id, {}).get("usd")
+            if current_price is None:
+                log.warning(f"  No price data for {coin_id}.")
+                continue
+        except Exception as e:
+            log.error(f"  Price fetch error ({coin_id}): {e}")
             continue
-        if 40 <= rv <= 60:
-            continue
-        news = fetch_news(m["name"])
-        sig = ai_signal(m, rv, news)
-        if sig and sig["action"] in ["BUY","SELL"]:
-            nh = news[0] if news else ""
-            nl = f"\n📰 {nh}" if nh else ""
-            msg = f"""⚡ AETHER ASCENT
 
-📊 {m['name']} ({m['symbol']})
-🎯 {sig['action']} | {sig['confidence']}% | RSI {rv}
+        symbol = trade["symbol"].upper()
+        entry  = trade["entry"]
+        tp     = trade["tp"]
+        sl     = trade["sl"]
+        signal = trade["signal"]
 
-💰 Entry: ${sig['entry']:,.2f}
-✅ TP: ${sig['tp']:,.2f}
-🛑 SL: ${sig['sl']:,.2f}
+        pnl_pct = ((current_price - entry) / entry * 100) if signal == "BUY" else ((entry - current_price) / entry * 100)
+        log.info(f"  {symbol}: entry=${entry:.4f} | now=${current_price:.4f} | PnL={pnl_pct:+.2f}%")
 
-📝 {sig['reasoning']}{nl}
+        hit_tp = (signal == "BUY"  and current_price >= tp) or (signal == "SELL" and current_price <= tp)
+        hit_sl = (signal == "BUY"  and current_price <= sl) or (signal == "SELL" and current_price >= sl)
 
-🕐 {datetime.now().strftime('%d/%m %H:%M UTC')}"""
-            send_tg(msg)
-            sent.append(cid)
-            save_json(SENT_FILE, sent[-50:])
-            trades.append({"coin": cid, "symbol": m["symbol"], "action": sig["action"], "entry": sig["entry"], "tp": sig["tp"], "sl": sig["sl"], "time": time.time()})
-            save_json(TRADE_FILE, trades)
-            print(f"SIGNAL: {m['symbol']} {sig['action']} {sig['confidence']}% RSI{rv}")
-            found += 1
-            time.sleep(5)
-        if found >= 3:
-            break
+        if hit_tp:
+            msg = (
+                f"✅ <b>TAKE PROFIT HIT — {trade['coin_name']} ({symbol})</b>\n\n"
+                f"📈 Signal:  {signal}\n"
+                f"💰 Entry:   ${entry:,.6f}\n"
+                f"🎯 TP:      ${tp:,.6f}\n"
+                f"📊 Current: ${current_price:,.6f}\n"
+                f"💹 PnL:     {pnl_pct:+.2f}%\n"
+                f"🕐 {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}"
+            )
+            send_telegram(msg)
+            log.info(f"  TP hit for {symbol}!")
+            closed.append(coin_id)
+
+        elif hit_sl:
+            msg = (
+                f"🛑 <b>STOP LOSS HIT — {trade['coin_name']} ({symbol})</b>\n\n"
+                f"📉 Signal:  {signal}\n"
+                f"💰 Entry:   ${entry:,.6f}\n"
+                f"🛑 SL:      ${sl:,.6f}\n"
+                f"📊 Current: ${current_price:,.6f}\n"
+                f"💹 PnL:     {pnl_pct:+.2f}%\n"
+                f"🕐 {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}"
+            )
+            send_telegram(msg)
+            log.info(f"  SL hit for {symbol}!")
+            closed.append(coin_id)
+
         time.sleep(2)
 
-def check_trades():
-    trades = load_json(TRADE_FILE)
-    updated = []
-    for t in trades:
-        if t.get("done"):
-            if time.time() - t["done"] > 86400:
-                continue
-            updated.append(t)
-            continue
-        price = fetch_price(t["coin"])
-        if not price:
-            updated.append(t)
-            continue
-        if t["action"] == "BUY":
-            if price >= t["tp"]:
-                msg = f"""✅ TP HIT!
+    for coin_id in closed:
+        active_trades.pop(coin_id, None)
+        log.info(f"  Trade closed and removed: {coin_id}")
 
-📊 {t['symbol']}
-🎯 BUY | ${t['entry']} → ${price}
-💰 Profit: ${round(price - t['entry'], 2)}
-🕐 {datetime.now().strftime('%d/%m %H:%M UTC')}"""
-                send_tg(msg)
-                t["done"] = time.time()
-                t["result"] = "TP"
-                print(f"TP HIT: {t['symbol']}")
-            elif price <= t["sl"]:
-                msg = f"""🛑 SL HIT!
+# ─────────────────────────────────────────────
+# Startup Validation
+# ─────────────────────────────────────────────
+def validate_env() -> bool:
+    missing = []
+    for var in ["GEMINI_API_KEY", "NEWS_API_KEY", "TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID"]:
+        if not os.environ.get(var):
+            missing.append(var)
+    if missing:
+        log.error(f"Missing required env vars: {', '.join(missing)}")
+        return False
+    return True
 
-📊 {t['symbol']}
-🎯 BUY | ${t['entry']} → ${price}
-💔 Loss: ${round(t['entry'] - price, 2)}
-🕐 {datetime.now().strftime('%d/%m %H:%M UTC')}"""
-                send_tg(msg)
-                t["done"] = time.time()
-                t["result"] = "SL"
-                print(f"SL HIT: {t['symbol']}")
-        elif t["action"] == "SELL":
-            if price <= t["tp"]:
-                msg = f"""✅ TP HIT!
+# ─────────────────────────────────────────────
+# Main Loop
+# ─────────────────────────────────────────────
+def main():
+    log.info("🚀 Crypto Signal Bot starting up...")
 
-📊 {t['symbol']}
-🎯 SELL | ${t['entry']} → ${price}
-💰 Profit: ${round(t['entry'] - price, 2)}
-🕐 {datetime.now().strftime('%d/%m %H:%M UTC')}"""
-                send_tg(msg)
-                t["done"] = time.time()
-                t["result"] = "TP"
-                print(f"TP HIT: {t['symbol']}")
-            elif price >= t["sl"]:
-                msg = f"""🛑 SL HIT!
+    if not validate_env():
+        log.error("Aborting — fix missing environment variables.")
+        raise SystemExit(1)
 
-📊 {t['symbol']}
-🎯 SELL | ${t['entry']} → ${price}
-💔 Loss: ${round(price - t['entry'], 2)}
-🕐 {datetime.now().strftime('%d/%m %H:%M UTC')}"""
-                send_tg(msg)
-                t["done"] = time.time()
-                t["result"] = "SL"
-                print(f"SL HIT: {t['symbol']}")
-        updated.append(t)
-    save_json(TRADE_FILE, updated)
+    if not init_gemini():
+        log.error("Aborting — Gemini client could not be initialised.")
+        raise SystemExit(1)
 
-print("="*30)
-print("AETHER ASCENT LIVE")
-print("="*30)
+    send_telegram(
+        "🤖 <b>Crypto Signal Bot is now live!</b>\n"
+        f"Signals every {SIGNAL_INTERVAL_SEC // 60} min | "
+        f"TP: {TP_PERCENT}% | SL: {SL_PERCENT}%"
+    )
 
-generate_signals()
-last_signal_scan = time.time()
+    last_signal_time = 0.0
 
-while True:
-    now = time.time()
-    print(f"[{datetime.now().strftime('%H:%M:%S')}] Running...")
-    try:
-        if now - last_signal_scan >= 900:
-            generate_signals()
-            last_signal_scan = now
-        check_trades()
-    except Exception as e:
-        print(f"Error: {e}")
-    time.sleep(60)
+    log.info("⏳ Entering main loop...")
+    while True:
+        try:
+            now = time.time()
+
+            # ── Every 15 minutes: run full signal cycle
+            if now - last_signal_time >= SIGNAL_INTERVAL_SEC:
+                run_signal_cycle()
+                last_signal_time = time.time()
+
+            # ── Every loop tick (1 min sleep): track trades
+            run_trade_tracker()
+
+        except KeyboardInterrupt:
+            log.info("Interrupted by user. Shutting down.")
+            break
+        except Exception as e:
+            log.error(f"Unhandled error in main loop: {e}")
+            log.error(traceback.format_exc())
+            # Don't crash — sleep and retry
+            time.sleep(30)
+
+        time.sleep(TRACK_INTERVAL_SEC)
+
+
+if __name__ == "__main__":
+    main()
