@@ -218,8 +218,9 @@ print("="*30)
 print("AETHER ASCENT LIVE")
 print("="*30)
 
-last_generate_signals()
+generate_signals()
 last_signal_scan = time.time()
+
 while True:
     now = time.time()
     print(f"[{datetime.now().strftime('%H:%M:%S')}] Running...")
