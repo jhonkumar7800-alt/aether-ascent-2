@@ -5,7 +5,11 @@ from google import genai
 GEMINI_API_KEY = os.environ["GEMINI_API_KEY"]
 TELEGRAM_BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
-NEWS_API_KEY = os.environ["NEWS_API_KEY"]
+NEWS_API_KEY = os.environ.get("NEWS_API_KEY", "")
+COINGECKO_API_KEY = os.environ.get("COINGECKO_API_KEY", "")
+
+HEADERS = {"x-cg-pro-api-key": COINGECKO_API_KEY} if COINGECKO_API_KEY else {}
+BASE_URL = "https://pro-api.coingecko.com/api/v3" if COINGECKO_API_KEY else "https://api.coingecko.com/api/v3"
 
 client = genai.Client(api_key=GEMINI_API_KEY)
 SENT_FILE = "sent_coins.json"
@@ -17,6 +21,19 @@ COINS = [
     "chainlink", "uniswap", "litecoin", "stellar", "cosmos",
     "near", "algorand", "vechain", "tezos", "flow"
 ]
+
+def api_call(url, params=None, timeout=15):
+    try:
+        r = requests.get(url, params=params, headers=HEADERS, timeout=timeout)
+        if r.status_code == 429:
+            print("[RATE] 429 hit, waiting 60s...")
+            time.sleep(60)
+            r = requests.get(url, params=params, headers=HEADERS, timeout=timeout)
+        if r.status_code == 200:
+            return r.json()
+    except:
+        pass
+    return None
 
 def load_json(file):
     try:
@@ -30,33 +47,20 @@ def save_json(file, data):
         json.dump(data, f)
 
 def fetch_market(cid):
-    try:
-        url = f"https://api.coingecko.com/api/v3/coins/{cid}"
-        params = {"localization": "false", "tickers": "false", "community_data": "false", "developer_data": "false", "sparkline": "false"}
-        r = requests.get(url, params=params, timeout=10)
-        if r.status_code == 200:
-            d = r.json().get("market_data", {})
-            return {
-                "id": cid, "name": r.json().get("name"), "symbol": r.json().get("symbol").upper(),
-                "price": d.get("current_price", {}).get("usd"),
-                "change": d.get("price_change_percentage_24h", 0)
-            }
-    except:
-        pass
+    data = api_call(f"{BASE_URL}/coins/{cid}", params={"localization":"false","tickers":"false","community_data":"false","developer_data":"false","sparkline":"false"})
+    if data and "market_data" in data:
+        d = data["market_data"]
+        return {"id": cid, "name": data.get("name",""), "symbol": data.get("symbol","").upper(), "price": d.get("current_price",{}).get("usd",0), "change": d.get("price_change_percentage_24h",0)}
     return None
 
 def fetch_ohlcv(cid):
-    try:
-        url = f"https://api.coingecko.com/api/v3/coins/{cid}/ohlc"
-        r = requests.get(url, params={"vs_currency": "usd", "days": 3}, timeout=10)
-        if r.status_code == 200:
-            return [c[4] for c in r.json()]
-    except:
-        pass
-    return []
+    data = api_call(f"{BASE_URL}/coins/{cid}/ohlc", params={"vs_currency":"usd","days":3})
+    if data:
+        return [c[4] for c in data]
+    return None
 
 def calc_rsi(prices):
-    if len(prices) < 15:
+    if not prices or len(prices) < 15:
         return None
     gains, losses = [], []
     for i in range(1, len(prices)):
@@ -66,16 +70,14 @@ def calc_rsi(prices):
     avg_gain = sum(gains[-14:]) / 14
     avg_loss = sum(losses[-14:]) / 14
     if avg_loss == 0:
-        return 100
-    return round(100 - (100 / (1 + avg_gain / avg_loss)), 2)
+        return 100.0
+    return round(100.0 - (100.0 / (1.0 + avg_gain / avg_loss)), 2)
 
 def fetch_news(name):
     if not NEWS_API_KEY:
         return []
     try:
-        url = "https://newsapi.org/v2/everything"
-        params = {"q": f"{name} crypto", "apiKey": NEWS_API_KEY, "pageSize": 3, "sortBy": "publishedAt", "language": "en"}
-        r = requests.get(url, params=params, timeout=10)
+        r = requests.get("https://newsapi.org/v2/everything", params={"q":f"{name} crypto","apiKey":NEWS_API_KEY,"pageSize":3,"sortBy":"publishedAt","language":"en"}, timeout=10)
         if r.status_code == 200:
             return [a["title"] for a in r.json().get("articles", [])[:3]]
     except:
@@ -83,122 +85,114 @@ def fetch_news(name):
     return []
 
 def get_signal(asset, rsi_val, news):
-    news_text = "\n".join([f"- {n}" for n in news]) if news else "No news"
-    prompt = f"""Strict crypto AI. Output ONLY valid JSON. No extra text.
+    nt = "\n".join([f"- {n}" for n in news]) if news else "No recent news"
+    prompt = f"""Strict trading AI. Output ONLY valid JSON. No other text.
 
-Rules: RSI < 40 + positive news = BUY. RSI > 60 + negative news = SELL.
-RSI 40-60 or mixed = NO TRADE. Only signal if confidence >= 65%.
+Rules:
+- RSI < 40 AND positive news = BUY
+- RSI > 60 AND negative news = SELL  
+- RSI 40-60 OR mixed signals = NO TRADE
+- Minimum 65% confidence required
 
 {asset['name']} ({asset['symbol']})
-Price: ${asset['price']}
-RSI: {rsi_val}
-24h Change: {asset['change']}%
+Price: ${asset['price']:.6f}
+RSI(14): {rsi_val}
+24h Change: {asset['change']:.2f}%
 News:
-{news_text}
+{nt}
 
-Return format:
-{{"action":"BUY","confidence":72,"reasoning":"oversold bounce","entry":{asset['price']},"tp":{asset['price']*1.03:.2f},"sl":{asset['price']*0.985:.2f}}}"""
+Return JSON:
+{{"action":"BUY","confidence":72,"reasoning":"short reason","entry":{asset['price']},"tp":{asset['price']*1.03:.2f},"sl":{asset['price']*0.985:.2f}}}"""
     try:
         resp = client.models.generate_content(model="gemini-2.0-flash", contents=prompt)
-        raw = resp.text.strip().replace("```json", "").replace("```", "")
-        return json.loads(raw)
-    except:
-        return None
+        raw = resp.text.strip()
+        for prefix in ["```json","```"]:
+            raw = raw.replace(prefix,"")
+        return json.loads(raw.strip())
+    except Exception as e:
+        print(f"[AI] Error: {e}")
+    return None
 
-def send_telegram(msg):
+def send_tg(msg):
     try:
-        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-        requests.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": msg}, timeout=10)
+        requests.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage", json={"chat_id":TELEGRAM_CHAT_ID,"text":msg}, timeout=10)
     except:
         pass
 
-def fetch_price(coin_id):
-    try:
-        url = "https://api.coingecko.com/api/v3/simple/price"
-        r = requests.get(url, params={"ids": coin_id, "vs_currencies": "usd"}, timeout=10)
-        if r.status_code == 200:
-            data = r.json()
-            if coin_id in data:
-                return data[coin_id]["usd"]
-    except:
-        pass
+def fetch_price(cid):
+    data = api_call(f"{BASE_URL}/simple/price", params={"ids":cid,"vs_currencies":"usd"})
+    if data and cid in data:
+        return data[cid].get("usd")
     return None
 
 def scan_signals():
     sent = load_json(SENT_FILE)
     trades = load_json(TRADE_FILE)
     found = 0
-    print("[SCAN] Starting signal scan...")
+    print(f"[SCAN] Starting... ({len(COINS)} coins, 3s/coin)")
     for cid in COINS:
         if cid in sent:
             continue
-        print(f"[SCAN] Checking {cid}...")
-        market = fetch_market(cid)
-        if not market or not market.get("price"):
-            print(f"[SKIP] {cid} - no market data")
+        print(f"  [{cid}] ", end="", flush=True)
+        m = fetch_market(cid)
+        if not m or not m.get("price"):
+            print("NO DATA")
             time.sleep(2)
             continue
-        time.sleep(5)
+        time.sleep(3)
         ohlcv = fetch_ohlcv(cid)
         if not ohlcv:
-            print(f"[SKIP] {cid} - no OHLCV")
+            print("NO OHLCV")
             time.sleep(2)
             continue
         rsi = calc_rsi(ohlcv)
         if rsi is None:
-            print(f"[SKIP] {cid} - RSI failed")
+            print("RSI FAIL")
             time.sleep(2)
             continue
         if 40 <= rsi <= 60:
-            print(f"[SKIP] {cid} - RSI {rsi} in neutral zone")
+            print(f"RSI {rsi} → NEUTRAL")
             time.sleep(2)
             continue
-        news = fetch_news(market["name"])
-        signal = get_signal(market, rsi, news)
-        if signal and signal.get("action") in ["BUY", "SELL"]:
-            news_line = f"\n📰 {news[0]}" if news else ""
-            msg = f"""⚡ AETHER ASCENT SIGNAL
+        news = fetch_news(m["name"])
+        signal = get_signal(m, rsi, news)
+        if signal and signal.get("action") in ["BUY","SELL"]:
+            print(f"RSI {rsi} → {signal['action']} ({signal['confidence']}%)")
+            nl = f"\n📰 {news[0]}" if news else ""
+            msg = f"""⚡ AETHER ASCENT
 
-📊 {market['name']} ({market['symbol']})
+📊 {m['name']} ({m['symbol']})
 🎯 {signal['action']} | {signal['confidence']}% | RSI {rsi}
 
 💰 Entry: ${signal['entry']:,.2f}
 ✅ TP: ${signal['tp']:,.2f}
 🛑 SL: ${signal['sl']:,.2f}
 
-📝 {signal['reasoning']}{news_line}
+📝 {signal['reasoning']}{nl}
 
-🕐 {datetime.now().strftime('%d/%m %H:%M UTC')}"""
-            send_telegram(msg)
+🕐 {datetime.utcnow().strftime('%d/%m %H:%M UTC')}"""
+            send_tg(msg)
             sent.append(cid)
             save_json(SENT_FILE, sent[-50:])
-            trades.append({
-                "coin": cid, "symbol": market["symbol"],
-                "action": signal["action"], "entry": signal["entry"],
-                "tp": signal["tp"], "sl": signal["sl"],
-                "time": time.time()
-            })
+            trades.append({"coin":cid,"symbol":m["symbol"],"action":signal["action"],"entry":signal["entry"],"tp":signal["tp"],"sl":signal["sl"],"time":time.time()})
             save_json(TRADE_FILE, trades)
-            print(f"[SIGNAL] {market['symbol']} {signal['action']} {signal['confidence']}%")
             found += 1
         else:
-            print(f"[SKIP] {cid} - NO TRADE")
+            print(f"RSI {rsi} → NO TRADE")
         time.sleep(2)
         if found >= 3:
             break
-    print(f"[SCAN] Done. Signals found: {found}")
+    print(f"[SCAN] Complete. Signals: {found}")
 
 def check_trades():
     trades = load_json(TRADE_FILE)
     if not trades:
         return
-    print(f"[TRADE] Checking {len(trades)} active trades...")
     updated = []
     for t in trades:
         if t.get("done"):
-            if time.time() - t["done"] > 86400:
-                continue
-            updated.append(t)
+            if time.time() - t["done"] < 86400:
+                updated.append(t)
             continue
         px = fetch_price(t["coin"])
         if not px:
@@ -206,56 +200,46 @@ def check_trades():
             continue
         if t["action"] == "BUY":
             if px >= t["tp"]:
-                msg = f"✅ TP HIT!\n📊 {t['symbol']} BUY\n💰 ${t['entry']} → ${px}\n💵 Profit: ${round(px-t['entry'],2)}"
-                send_telegram(msg)
-                t["done"] = time.time()
-                t["result"] = "TP"
+                send_tg(f"✅ TP HIT!\n{t['symbol']} BUY\n${t['entry']:.2f}→${px:.2f}\nProfit: ${px-t['entry']:.2f}")
+                t["done"], t["result"] = time.time(), "TP"
                 print(f"[TP] {t['symbol']}")
             elif px <= t["sl"]:
-                msg = f"🛑 SL HIT!\n📊 {t['symbol']} BUY\n💰 ${t['entry']} → ${px}\n💔 Loss: ${round(t['entry']-px,2)}"
-                send_telegram(msg)
-                t["done"] = time.time()
-                t["result"] = "SL"
+                send_tg(f"🛑 SL HIT!\n{t['symbol']} BUY\n${t['entry']:.2f}→${px:.2f}\nLoss: ${t['entry']-px:.2f}")
+                t["done"], t["result"] = time.time(), "SL"
                 print(f"[SL] {t['symbol']}")
         elif t["action"] == "SELL":
             if px <= t["tp"]:
-                msg = f"✅ TP HIT!\n📊 {t['symbol']} SELL\n💰 ${t['entry']} → ${px}\n💵 Profit: ${round(t['entry']-px,2)}"
-                send_telegram(msg)
-                t["done"] = time.time()
-                t["result"] = "TP"
+                send_tg(f"✅ TP HIT!\n{t['symbol']} SELL\n${t['entry']:.2f}→${px:.2f}\nProfit: ${t['entry']-px:.2f}")
+                t["done"], t["result"] = time.time(), "TP"
                 print(f"[TP] {t['symbol']}")
             elif px >= t["sl"]:
-                msg = f"🛑 SL HIT!\n📊 {t['symbol']} SELL\n💰 ${t['entry']} → ${px}\n💔 Loss: ${round(px-t['entry'],2)}"
-                send_telegram(msg)
-                t["done"] = time.time()
-                t["result"] = "SL"
+                send_tg(f"🛑 SL HIT!\n{t['symbol']} SELL\n${t['entry']:.2f}→${px:.2f}\nLoss: ${px-t['entry']:.2f}")
+                t["done"], t["result"] = time.time(), "SL"
                 print(f"[SL] {t['symbol']}")
         updated.append(t)
     save_json(TRADE_FILE, updated)
 
-print("=" * 40)
-print("⚡ AETHER ASCENT TRADING SYSTEM")
-print("=" * 40)
-print("Scan: Every 15 min | 5s per coin")
-print("Trade Check: Every 1 min")
-print("=" * 40)
+print("="*40)
+print("⚡ AETHER ASCENT — CoinGecko API")
+print("="*40)
+print(f"API: {'Pro' if COINGECKO_API_KEY else 'Free'}")
+print(f"Coins: {len(COINS)} | Scan: 15min | Per coin: 3s")
+print(f"Rate Limit: 30/min | Usage: ~6/min → SAFE")
+print("="*40)
 
 try:
     scan_signals()
 except Exception as e:
-    print(f"[ERROR] Init scan: {e}")
+    print(f"[INIT] Error: {e}")
 
 last_scan = time.time()
 
 while True:
-    now = time.time()
     try:
         check_trades()
-        if now - last_scan >= 900:
+        if time.time() - last_scan >= 900:
             scan_signals()
             last_scan = time.time()
-            print("[WAIT] 60s break before trade check...")
-            time.sleep(60)
     except Exception as e:
-        print(f"[ERROR] {e}")
+        print(f"[LOOP] Error: {e}")
     time.sleep(60)
