@@ -250,11 +250,7 @@ def fetch_news_headlines(query: str, max_articles: int = 5) -> list:
         return []
 
 # ─────────────────────────────────────────────
-# Gemini AI
-# BUG FIX 6: gemini-2.0-flash does not exist in stable SDK yet.
-#            Use gemini-1.5-flash which is stable & free-tier supported.
-#            Also added explicit safety_settings=[] to avoid refusals on
-#            finance content.
+# Gemini AI  – gemini-2.0-flash (free tier, stable)
 # ─────────────────────────────────────────────
 
 def ask_gemini(coin_id: str, symbol: str, price: float, rsi: float, headlines: list):
@@ -538,9 +534,12 @@ def scan_all_coins():
     signals = 0
     for idx, coin_id in enumerate(COINS, 1):
         try:
-            before = len(active_trades)
+            with trades_lock:
+                before = len(active_trades)
             scan_coin(coin_id)
-            if len(active_trades) > before:
+            with trades_lock:
+                after = len(active_trades)
+            if after > before:
                 signals += 1
         except Exception as exc:
             log.error("[SCAN_ERROR] %s – %s", coin_id, exc)
@@ -549,7 +548,8 @@ def scan_all_coins():
         if idx < len(COINS):
             time.sleep(COIN_DELAY_SEC)
 
-    log.info("[SCAN] ══════ Done – signals sent: %d ══════", signals)
+    log.info("[SCAN] ══════ Done – signals: %d | active trades: %d ══════",
+             signals, len(active_trades))
 
 # ─────────────────────────────────────────────
 # Entry point
@@ -574,7 +574,7 @@ def main():
 
     # ── Init Gemini ──────────────────────────────
     genai.configure(api_key=GEMINI_API_KEY)
-    gemini_model = genai.GenerativeModel("gemini-1.5-flash")
+    gemini_model = genai.GenerativeModel("gemini-2.0-flash")
 
     log.info("=" * 55)
     log.info("  Crypto Signal Bot  –  STARTED")
